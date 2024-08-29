@@ -1,0 +1,120 @@
+import pandas as pd
+from datetime import datetime, timedelta
+import re
+
+# Import Trayectos file
+Trayectos = pd.read_csv('/Users/arantxamenmay/Downloads/METIAB Trayecto_29ago24.xlsx - Trayectos (1).csv')
+
+# Clean dataframe
+Trayectos['Folio'] = Trayectos['Folio'].fillna(0)
+Trayectos = Trayectos[Trayectos['Folio'] != 0]
+Trayectos['Folio'] = Trayectos['Folio'].astype(int)
+Trayectos.columns = Trayectos.columns.str.strip()
+
+# Clean dates columns (removing dates that aren't in mm/dd/yy)
+Trayectos_grouped = Trayectos.groupby(by='Folio')
+pattern = re.compile(r'[^0-9/]')
+filtered_groups = [
+    group for name, group in Trayectos_grouped 
+    if not (group['Fecha Llegada (Mes/Dia/Año)'].fillna('').astype(str).str.contains(pattern).any() or 
+            group['Fecha Partida (Mes/Dia/Año)'].fillna('').astype(str).str.contains(pattern).any())
+]
+filtered = pd.concat(filtered_groups)
+Trayectos = filtered.reset_index()
+Trayectos_grouped = Trayectos.groupby(by='Folio')
+
+# Make dates into datetime format
+Trayectos['Fecha Llegada (Mes/Dia/Año)'] = pd.to_datetime(Trayectos['Fecha Llegada (Mes/Dia/Año)'], errors='coerce', format='%m/%d/%Y')
+Trayectos['Fecha Partida (Mes/Dia/Año)'] = pd.to_datetime(Trayectos['Fecha Partida (Mes/Dia/Año)'], errors='coerce', format='%m/%d/%Y')
+
+# Create date ranges dataframe 
+start_date = Trayectos_grouped['Fecha Partida (Mes/Dia/Año)'].min()
+end_date = Trayectos_grouped['Fecha Llegada (Mes/Dia/Año)'].max()
+dates = pd.merge(start_date, end_date, left_on="Folio",right_on="Folio",how="left")
+#dates = dates.drop(0)
+dates = dates.dropna()
+
+def daterange(start_date, end_date):
+    date_range = pd.date_range(start_date, end_date)
+    return date_range
+
+dates['date_range'] = dates.apply(lambda row: daterange(row['Fecha Partida (Mes/Dia/Año)'], row['Fecha Llegada (Mes/Dia/Año)']), axis=1)
+dates = dates.reset_index()
+dates = dates.drop(columns=['Fecha Partida (Mes/Dia/Año)', 'Fecha Llegada (Mes/Dia/Año)'])
+
+# Define a function to expand rows
+def expand_rows(row):
+    expanded = []
+    if row['Porcion Viaje'] == 1:
+        if pd.notna(row['Fecha Partida (Mes/Dia/Año)']):
+            new_row = row.copy()
+            new_row['Fecha'] = row['Fecha Partida (Mes/Dia/Año)']
+            expanded.append(new_row)
+    else:
+        start_date = row['Fecha Llegada (Mes/Dia/Año)']
+        end_date = row['Fecha Partida (Mes/Dia/Año)']
+        
+        if pd.isna(start_date) and pd.isna(end_date):
+            expanded.append(row)
+        else:
+            if pd.isna(start_date):
+                start_date = end_date
+            if pd.isna(end_date):
+                end_date = start_date
+            
+            for single_date in pd.date_range(start_date, end_date):
+                new_row = row.copy()
+                new_row['Fecha'] = single_date
+                expanded.append(new_row)
+    
+    return expanded
+
+# Process the data in smaller chunks
+chunk_size = 100
+chunks = [Trayectos.iloc[i:i + chunk_size] for i in range(0, Trayectos.shape[0], chunk_size)]
+
+expanded_chunks = []
+
+for chunk in chunks:
+    expanded_chunk = pd.concat([pd.DataFrame(expand_rows(row)) for idx, row in chunk.iterrows()])
+    expanded_chunks.append(expanded_chunk)
+
+# Concatenate all expanded chunks
+expanded_data = pd.concat(expanded_chunks)
+
+# Drop the original date columns and keep only the new 'Fecha' column
+expanded_data = expanded_data.drop(columns=['Fecha Llegada (Mes/Dia/Año)', 'Fecha Partida (Mes/Dia/Año)'])
+
+# Select only the required columns in the desired order and rename them accordingly
+expanded_data = expanded_data[['Folio', 'Fecha', 'Latitude', 'Longitude', 'Elevation (meters)', 
+                               'Pueblo, Municipio Partida', 'País', 'Tiempo Ubicacion', 'Metodo de Transporte (Tiempo en Transito)', 'Comentarios']]
+
+expanded_data.columns = ['Folio', 'Date', 'Latitude', 'Longitude', 'Elevation (meters)', 'City/Town', 
+                         'Country', 'Hours at Location', 'Transit Mode (as Departed from this column\'s location)', 'comments']
+
+# Add missing dates 
+new_rows = []
+for idx, row in dates.iterrows():
+    folio = row['Folio']
+    date_range = row['date_range']
+    
+    # Filter expanded_data for the folio and get the 'dates' as a Series
+    participant_dates = expanded_data[expanded_data['Folio'] == folio]['Date']
+    
+    # Check and add missing dates
+    for date in date_range:
+        if date not in participant_dates.values:
+            new_rows.append({'Folio': folio, 'Date': date})
+
+# Append new rows to expanded_data using pd.concat
+if new_rows:
+    expanded_data = pd.concat([expanded_data, pd.DataFrame(new_rows)], ignore_index=True)
+
+# Sort the DataFrame by participant_id and dates
+expanded_data = expanded_data.sort_values(by=['Folio', 'Date']).reset_index(drop=True)
+
+# Save the expanded dataframe to a new CSV file
+expanded_file_path = 'expanded_trayectos.csv'
+expanded_data.to_csv(expanded_file_path, index=False)
+
+print(f"Expanded data saved to {expanded_file_path}")
